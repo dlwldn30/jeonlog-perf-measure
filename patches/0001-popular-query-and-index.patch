@@ -1,0 +1,278 @@
+From 888fab13b687f295e9a2f04c64c4c36f21ded724 Mon Sep 17 00:00:00 2001
+From: dlwldn30 <dlwldn30@naver.com>
+Date: Tue, 13 Oct 2026 21:17:50 +0900
+Subject: [PATCH] =?UTF-8?q?perf(recommendation):=20=EC=9D=B8=EA=B8=B0=20?=
+ =?UTF-8?q?=EC=A0=84=EC=8B=9C=20=EC=A7=91=EA=B3=84=20=EC=BF=BC=EB=A6=AC?=
+ =?UTF-8?q?=EC=9D=98=20JOIN=20=EA=B3=B1=20=EC=A0=9C=EA=B1=B0=20=EB=B0=8F?=
+ =?UTF-8?q?=20=EB=B3=B5=ED=95=A9=20=EC=9D=B8=EB=8D=B1=EC=8A=A4=20=EC=B6=94?=
+ =?UTF-8?q?=EA=B0=80?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+클릭 로그와 북마크를 한 번에 JOIN해 전시마다 (클릭 수 × 북마크 수)개의 행이 만들어지던 것을
+전시별 상관 서브쿼리로 각각 세도록 바꾸고, 기간 범위 조회용 복합 인덱스를 추가했다.
+합성 데이터(전시 1만·클릭 로그 약 40만·북마크 약 8만) 기준 5회 중앙값 약 1.3초 → 약 0.08초,
+상위 10개 전시는 동일. 순위 의미 보존 회귀 테스트 3개 추가.
+---
+ .../bookmark/domain/Bookmark.java             |   3 +-
+ .../exhibition/domain/ExhibitionClickLog.java |   3 +
+ .../PopularRecommendationRepository.java      |  40 +++--
+ .../PopularRecommendationRepositoryTest.java  | 165 ++++++++++++++++++
+ 4 files changed, 193 insertions(+), 18 deletions(-)
+ create mode 100644 src/test/java/com/jeonlog/exhibition_recommender/recommendation/repository/PopularRecommendationRepositoryTest.java
+
+diff --git a/src/main/java/com/jeonlog/exhibition_recommender/bookmark/domain/Bookmark.java b/src/main/java/com/jeonlog/exhibition_recommender/bookmark/domain/Bookmark.java
+index 5616e8f..d4197fe 100644
+--- a/src/main/java/com/jeonlog/exhibition_recommender/bookmark/domain/Bookmark.java
++++ b/src/main/java/com/jeonlog/exhibition_recommender/bookmark/domain/Bookmark.java
+@@ -18,7 +18,8 @@ import java.time.LocalDateTime;
+                 columnNames = {"user_id", "exhibition_id"}
+         ),
+         indexes = {
+-                @Index(name = "idx_bookmark_exhibition", columnList = "exhibition_id"),
++                // 전시별 기간 북마크 수 조회용 (exhibition_id 단독 조회도 이 인덱스가 담당)
++                @Index(name = "idx_bookmark_exhibition_created", columnList = "exhibition_id, created_at"),
+                 @Index(name = "idx_bookmark_user", columnList = "user_id")
+         }
+ )
+diff --git a/src/main/java/com/jeonlog/exhibition_recommender/exhibition/domain/ExhibitionClickLog.java b/src/main/java/com/jeonlog/exhibition_recommender/exhibition/domain/ExhibitionClickLog.java
+index 05eb92d..3618e03 100644
+--- a/src/main/java/com/jeonlog/exhibition_recommender/exhibition/domain/ExhibitionClickLog.java
++++ b/src/main/java/com/jeonlog/exhibition_recommender/exhibition/domain/ExhibitionClickLog.java
+@@ -9,6 +9,9 @@ import java.time.LocalDate;
+ @Entity
+ @Table(name = "exhibition_click_logs", uniqueConstraints = {
+         @UniqueConstraint(columnNames = {"user_id", "exhibition_id", "clicked_date"})
++}, indexes = {
++        // 전시별 기간 클릭 수 조회용 (유니크 키는 user_id가 앞이라 전시 기준 범위 조회에 쓸 수 없다)
++        @Index(name = "idx_click_exhibition_date", columnList = "exhibition_id, clicked_date")
+ })
+ @Getter
+ @NoArgsConstructor(access = AccessLevel.PROTECTED)
+diff --git a/src/main/java/com/jeonlog/exhibition_recommender/recommendation/repository/PopularRecommendationRepository.java b/src/main/java/com/jeonlog/exhibition_recommender/recommendation/repository/PopularRecommendationRepository.java
+index f21af75..fe7ad6c 100644
+--- a/src/main/java/com/jeonlog/exhibition_recommender/recommendation/repository/PopularRecommendationRepository.java
++++ b/src/main/java/com/jeonlog/exhibition_recommender/recommendation/repository/PopularRecommendationRepository.java
+@@ -11,24 +11,30 @@ import java.util.List;
+ 
+ public interface PopularRecommendationRepository extends JpaRepository<Exhibition, Long> {
+ 
++    /**
++     * 인기 전시 id 조회.
++     * 클릭 로그와 북마크를 한 번에 JOIN하면 전시마다 (클릭 수 × 북마크 수)개의 행이 만들어져
++     * COUNT(DISTINCT)로 값은 맞아도 중간 행이 크게 늘어난다.
++     * 그래서 전시별로 클릭 수와 북마크 수를 각각 상관 서브쿼리로 센 뒤 점수를 계산한다.
++     * (exhibition_id, 날짜) 복합 인덱스를 타므로 전시마다 범위 조회 한 번으로 끝난다.
++     */
+     @Query("""
+-        SELECT e.id
+-        FROM Exhibition e
+-        LEFT JOIN ExhibitionClickLog ecl
+-               ON ecl.exhibition = e
+-              AND ecl.clickedDate BETWEEN :fromDate AND :toDate
+-        LEFT JOIN Bookmark b
+-               ON b.exhibition = e
+-              AND b.createdAt BETWEEN :fromDt AND :toDt
+-        WHERE e.endDate >= :today
+-        GROUP BY e.id
+-        ORDER BY (
+-            COUNT(DISTINCT ecl.id) * :clickWeight
+-          + COUNT(DISTINCT b.id)  * :bookmarkWeight
+-        ) DESC,
+-        COUNT(DISTINCT b.id) DESC,
+-        COUNT(DISTINCT ecl.id) DESC,
+-        e.id DESC
++        SELECT t.id
++        FROM (
++            SELECT e.id AS id,
++                   (SELECT COUNT(ecl) FROM ExhibitionClickLog ecl
++                     WHERE ecl.exhibition = e
++                       AND ecl.clickedDate BETWEEN :fromDate AND :toDate) AS clicks,
++                   (SELECT COUNT(b) FROM Bookmark b
++                     WHERE b.exhibition = e
++                       AND b.createdAt BETWEEN :fromDt AND :toDt) AS bookmarks
++            FROM Exhibition e
++            WHERE e.endDate >= :today
++        ) t
++        ORDER BY (t.clicks * :clickWeight + t.bookmarks * :bookmarkWeight) DESC,
++                 t.bookmarks DESC,
++                 t.clicks DESC,
++                 t.id DESC
+         """)
+     List<Long> findTopPopularExhibitionIds(
+             @Param("today") LocalDate today,
+diff --git a/src/test/java/com/jeonlog/exhibition_recommender/recommendation/repository/PopularRecommendationRepositoryTest.java b/src/test/java/com/jeonlog/exhibition_recommender/recommendation/repository/PopularRecommendationRepositoryTest.java
+new file mode 100644
+index 0000000..91067bc
+--- /dev/null
++++ b/src/test/java/com/jeonlog/exhibition_recommender/recommendation/repository/PopularRecommendationRepositoryTest.java
+@@ -0,0 +1,165 @@
++package com.jeonlog.exhibition_recommender.recommendation.repository;
++
++import com.jeonlog.exhibition_recommender.bookmark.domain.Bookmark;
++import com.jeonlog.exhibition_recommender.exhibition.domain.Exhibition;
++import com.jeonlog.exhibition_recommender.exhibition.domain.ExhibitionClickLog;
++import com.jeonlog.exhibition_recommender.exhibition.domain.ExhibitionTheme;
++import com.jeonlog.exhibition_recommender.exhibition.domain.GenreType;
++import com.jeonlog.exhibition_recommender.exhibition.domain.Venue;
++import com.jeonlog.exhibition_recommender.exhibition.domain.VenueType;
++import com.jeonlog.exhibition_recommender.support.MySqlContainerTestSupport;
++import com.jeonlog.exhibition_recommender.user.domain.OauthProvider;
++import com.jeonlog.exhibition_recommender.user.domain.Role;
++import com.jeonlog.exhibition_recommender.user.domain.User;
++import jakarta.persistence.EntityManager;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.data.domain.PageRequest;
++import org.springframework.test.context.ActiveProfiles;
++import org.springframework.transaction.annotation.Transactional;
++
++import java.time.LocalDate;
++import java.time.LocalDateTime;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.UUID;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++/**
++ * 인기 전시 집계 쿼리가 클릭 수와 북마크 수를 각각 올바르게 세는지 고정한다.
++ * 클릭 로그와 북마크를 한 번에 JOIN하는 방식은 전시마다 (클릭 수 × 북마크 수)개의 행이 만들어지는데,
++ * 서브쿼리로 바꾸면서 점수 계산과 정렬 기준(점수 → 북마크 → 클릭 → id 내림차순)이 달라지지 않았는지 확인한다.
++ */
++@SpringBootTest
++@ActiveProfiles("test")
++@Transactional
++class PopularRecommendationRepositoryTest extends MySqlContainerTestSupport {
++
++    private static final LocalDate TODAY = LocalDate.now();
++
++    @Autowired
++    private PopularRecommendationRepository popularRepository;
++    @Autowired
++    private EntityManager em;
++
++    private Venue venue;
++    private final List<User> users = new ArrayList<>();
++
++    @Test
++    void 클릭과_북마크를_각각_세어_점수순으로_정렬한다() {
++        venue = persistVenue();
++        for (int i = 0; i < 6; i++) users.add(persistUser());
++
++        // 클릭 3 · 북마크 2 → 점수 5 (JOIN 곱으로 세면 6행이 되어 점수가 부풀어 1위가 되는 전시)
++        Exhibition a = persistExhibition("A", TODAY.plusDays(5));
++        clicks(a, 3, TODAY);
++        bookmarks(a, 2);
++        // 클릭 6 · 북마크 0 → 점수 6
++        Exhibition b = persistExhibition("B", TODAY.plusDays(5));
++        clicks(b, 6, TODAY);
++        // 클릭 1 · 북마크 4 → 점수 5, A와 동점이면 북마크가 많은 쪽이 먼저
++        Exhibition c = persistExhibition("C", TODAY.plusDays(5));
++        clicks(c, 1, TODAY);
++        bookmarks(c, 4);
++        em.flush();
++        em.clear();
++
++        List<Long> ids = findTop();
++
++        assertThat(ids).startsWith(b.getId(), c.getId(), a.getId());
++    }
++
++    @Test
++    void 종료된_전시와_집계_기간_밖_클릭은_점수에_반영하지_않는다() {
++        venue = persistVenue();
++        for (int i = 0; i < 6; i++) users.add(persistUser());
++
++        // 어제 끝난 전시는 클릭이 아무리 많아도 제외
++        Exhibition ended = persistExhibition("ended", TODAY.minusDays(1));
++        clicks(ended, 6, TODAY);
++        // 집계 기간(30일) 밖 클릭 6개는 점수 0, 기간 안 클릭 1개인 전시가 먼저
++        Exhibition old = persistExhibition("old", TODAY.plusDays(5));
++        clicks(old, 6, TODAY.minusDays(40));
++        Exhibition recent = persistExhibition("recent", TODAY.plusDays(5));
++        clicks(recent, 1, TODAY);
++        em.flush();
++        em.clear();
++
++        List<Long> ids = findTop();
++
++        assertThat(ids).doesNotContain(ended.getId());
++        assertThat(ids).startsWith(recent.getId(), old.getId());
++    }
++
++    @Test
++    void 점수와_북마크와_클릭이_모두_같으면_id가_큰_전시가_먼저다() {
++        venue = persistVenue();
++        for (int i = 0; i < 6; i++) users.add(persistUser());
++
++        Exhibition first = persistExhibition("first", TODAY.plusDays(5));
++        Exhibition second = persistExhibition("second", TODAY.plusDays(5));
++        clicks(first, 2, TODAY);
++        clicks(second, 2, TODAY);
++        em.flush();
++        em.clear();
++
++        assertThat(findTop()).startsWith(second.getId(), first.getId());
++    }
++
++    private List<Long> findTop() {
++        LocalDateTime now = LocalDateTime.now();
++        return popularRepository.findTopPopularExhibitionIds(
++                TODAY, TODAY.minusDays(30), TODAY, now.minusDays(30), now.plusMinutes(1),
++                1.0, 1.0, PageRequest.of(0, 10));
++    }
++
++    private void clicks(Exhibition exhibition, int count, LocalDate date) {
++        for (int i = 0; i < count; i++) {
++            em.persist(ExhibitionClickLog.builder()
++                    .user(users.get(i)).exhibition(exhibition).clickedDate(date).build());
++        }
++    }
++
++    private void bookmarks(Exhibition exhibition, int count) {
++        for (int i = 0; i < count; i++) {
++            em.persist(Bookmark.builder().user(users.get(i)).exhibition(exhibition).build());
++        }
++    }
++
++    private Venue persistVenue() {
++        Venue v = Venue.builder().name("테스트 전시장").type(VenueType.GALLERY).build();
++        em.persist(v);
++        return v;
++    }
++
++    private User persistUser() {
++        String unique = UUID.randomUUID().toString().substring(0, 8);
++        User u = User.builder()
++                .email("popular-" + unique + "@example.com")
++                .name("popular-name-" + unique)
++                .oauthProvider(OauthProvider.GOOGLE)
++                .oauthId("popular-oauth-" + unique)
++                .nickname("popular-nick-" + unique)
++                .role(Role.USER)
++                .build();
++        em.persist(u);
++        return u;
++    }
++
++    private Exhibition persistExhibition(String title, LocalDate endDate) {
++        Exhibition e = Exhibition.builder()
++                .title(title).description("설명").location("서울")
++                .posterUrl("https://example.com/poster.jpg")
++                .startDate(TODAY.minusDays(10)).endDate(endDate)
++                .price(0).isFree(true)
++                .exhibitionTheme(ExhibitionTheme.CASUAL_VISIT).genre(GenreType.MODERN_ART)
++                .contact("02-0000-0000").website("https://example.com").viewingTime("10:00-18:00")
++                .personalizedPosterUrl("https://example.com/personalized.jpg")
++                .generalRecommendationsPosterUrl("https://example.com/general.jpg")
++                .venue(venue).build();
++        em.persist(e);
++        return e;
++    }
++}
+-- 
+2.45.2
+

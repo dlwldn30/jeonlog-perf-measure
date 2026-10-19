@@ -1,0 +1,103 @@
+diff --git a/src/main/java/com/jeonlog/exhibition_recommender/recommendation/service/PopularRecommendationService.java b/src/main/java/com/jeonlog/exhibition_recommender/recommendation/service/PopularRecommendationService.java
+index 9077514..577c724 100644
+--- a/src/main/java/com/jeonlog/exhibition_recommender/recommendation/service/PopularRecommendationService.java
++++ b/src/main/java/com/jeonlog/exhibition_recommender/recommendation/service/PopularRecommendationService.java
+@@ -3,11 +3,14 @@ package com.jeonlog.exhibition_recommender.recommendation.service;
+ import com.jeonlog.exhibition_recommender.exhibition.domain.Exhibition;
+ import com.jeonlog.exhibition_recommender.recommendation.dto.RecommendationDto;
+ import com.jeonlog.exhibition_recommender.recommendation.repository.PopularRecommendationRepository;
++import com.github.benmanes.caffeine.cache.Cache;
++import com.github.benmanes.caffeine.cache.Caffeine;
+ import lombok.RequiredArgsConstructor;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+ 
+ import java.time.LocalDate;
++import java.time.Duration;
+ import java.time.LocalDateTime;
+ import java.util.*;
+ import java.util.stream.Collectors;
+@@ -20,11 +23,33 @@ public class PopularRecommendationService {
+     private static final double MIN_WEIGHT = 0.0;
+     private static final double MAX_WEIGHT = 10.0;
+ 
++    /**
++     * 인기 집계 결과 캐시.
++     * 집계 쿼리는 요청마다 전시 전체를 훑어 동시 요청에서 DB가 병목이 되므로,
++     * 순위가 1분 정도 늦게 갱신돼도 문제없는 특성을 이용해 TTL 60초로 결과를 재사용한다.
++     * Caffeine의 get(key, loader)는 같은 키의 동시 만료 시 로더를 한 번만 실행해 쿼리 폭주(스탬피드)를 막는다.
++     * 인스턴스 로컬 캐시라 서버마다 별도로 유지되며, 인기 순위 특성상 인스턴스 간 불일치는 허용한다.
++     */
++    private static final Duration CACHE_TTL = Duration.ofSeconds(60);
++    private final Cache<PopularKey, List<RecommendationDto>> cache = Caffeine.newBuilder()
++            .expireAfterWrite(CACHE_TTL)
++            .maximumSize(100)
++            .build();
++
++    /** 날짜가 바뀌면 조회 기간이 달라지므로 오늘 날짜를 키에 포함한다. */
++    private record PopularKey(LocalDate today, int days, double clickWeight, double bookmarkWeight) {}
++
+     @Transactional(readOnly = true)
+     public List<RecommendationDto> getPopular(int days, double clickWeight, double bookmarkWeight) {
+         validateDays(days);
+         validateWeights(clickWeight, bookmarkWeight);
+ 
++        PopularKey key = new PopularKey(LocalDate.now(), days, clickWeight, bookmarkWeight);
++        return cache.get(key, k -> loadPopular(days, clickWeight, bookmarkWeight));
++    }
++
++    /** 캐시 미스일 때만 실행되는 실제 집계. */
++    private List<RecommendationDto> loadPopular(int days, double clickWeight, double bookmarkWeight) {
+         LocalDate today = LocalDate.now();
+         LocalDate fromDate = today.minusDays(days);
+         LocalDate toDate = today;
+diff --git a/src/test/java/com/jeonlog/exhibition_recommender/recommendation/service/PopularRecommendationServiceCacheTest.java b/src/test/java/com/jeonlog/exhibition_recommender/recommendation/service/PopularRecommendationServiceCacheTest.java
+new file mode 100644
+index 0000000..11d229f
+--- /dev/null
++++ b/src/test/java/com/jeonlog/exhibition_recommender/recommendation/service/PopularRecommendationServiceCacheTest.java
+@@ -0,0 +1,44 @@
++package com.jeonlog.exhibition_recommender.recommendation.service;
++
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyDouble;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++import com.jeonlog.exhibition_recommender.recommendation.repository.PopularRecommendationRepository;
++import java.util.List;
++import org.junit.jupiter.api.Test;
++
++/** 인기 집계 캐시가 같은 조건의 반복 요청에서 집계 쿼리를 한 번만 실행하는지 확인한다. */
++class PopularRecommendationServiceCacheTest {
++
++    private final PopularRecommendationRepository repository = mock(PopularRecommendationRepository.class);
++    private final PopularRecommendationService service = new PopularRecommendationService(repository);
++
++    @Test
++    void 같은_조건으로_반복_호출하면_집계_쿼리는_한_번만_실행된다() {
++        when(repository.findTopPopularExhibitionIds(any(), any(), any(), any(), any(), anyDouble(), anyDouble(), any()))
++                .thenReturn(List.of());
++
++        service.getPopular(30, 1.0, 1.0);
++        service.getPopular(30, 1.0, 1.0);
++        service.getPopular(30, 1.0, 1.0);
++
++        verify(repository, times(1))
++                .findTopPopularExhibitionIds(any(), any(), any(), any(), any(), anyDouble(), anyDouble(), any());
++    }
++
++    @Test
++    void 조건이_다르면_캐시를_공유하지_않는다() {
++        when(repository.findTopPopularExhibitionIds(any(), any(), any(), any(), any(), anyDouble(), anyDouble(), any()))
++                .thenReturn(List.of());
++
++        service.getPopular(30, 1.0, 1.0);
++        service.getPopular(7, 1.0, 1.0);
++
++        verify(repository, times(2))
++                .findTopPopularExhibitionIds(any(), any(), any(), any(), any(), anyDouble(), anyDouble(), any());
++    }
++}
